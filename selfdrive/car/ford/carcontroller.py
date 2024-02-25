@@ -13,6 +13,7 @@ from openpilot.selfdrive.car.ford import fordcan
 from openpilot.selfdrive.car.ford.values import CANFD_CAR, CarControllerParams
 from openpilot.selfdrive.controls.lib.drive_helpers import V_CRUISE_MAX, CONTROL_N
 from openpilot.selfdrive.modeld.constants import ModelConstants
+from openpilot.common.swaglog import cloudlog
 
 LongCtrlState = car.CarControl.Actuators.LongControlState
 VisualAlert = car.CarControl.HUDControl.VisualAlert
@@ -95,6 +96,7 @@ class CarController:
     self.frame = 0
 
     self.apply_curvature_last = 0
+    self.apply_curvature_last2 = 0
     self.main_on_last = False
     self.lkas_enabled_last = False
     self.steer_alert_last = False
@@ -172,16 +174,16 @@ class CarController:
     self.future_lookup_time_diff = 0.5
     self.future_lookup_time = CP.steerActuatorDelay
     self.future_curvature_time_v = [self.future_lookup_time, self.future_lookup_time_diff + self.future_lookup_time] # how many seconds in the future to use predicted curvature
-    self.future_curvature_time_bp = [5.0, 30.0] # corresponding speeds in m/s in [0, ~40] in 1.0 increments
+    self.future_curvature_time_bp = [17.0, 30.0] # corresponding speeds in m/s in [0, ~40] in 1.0 increments  TUNE THIS FOR ENTRY EXIT IN CURVES AT DIFF SPEEDS. 17 = no early entry below 38mph
     self.rate_future_time = 0.3 # how many seconds in the future for path offset rate date lookup
-    self.path_offset_rate_position_lat_accel_adjust_scale = 0.007
-    self.path_offset_rate_laneline_lat_accel_adjust_scale = 0.015
+    self.path_offset_rate_position_lat_accel_adjust_scale = 0.014 #from 0.007 to 0.014 attemping not to cross lines at low speeds
+    self.path_offset_rate_laneline_lat_accel_adjust_scale = 0.030 #from 0.015 to 0.030 attemping not to cross lines at low speeds
     self.path_offset_rate_laneline = FirstOrderFilter(0.0, 0.1, 0.05)
-    self.path_offset_lat_accel_adjust_scale = 0.2
+    self.path_offset_lat_accel_adjust_scale = 0.4 #up to 0.4 from 0.2 trying not to cross lines
     self.path_offset_scale = -1.0
     self.path_offset_rate_scale = -0.07 # determined in plotjuggler to best match with `LatCtlPath_An_Actl`
     self.path_offset_rate_curvature_adjustment_bp = [17.0, 20.0] # m/s , 17 suggested by Isaac
-    self.path_offset_rate_curvature_adjustment_v = [4.0, 0.0] # this adjustment turns off at higher speeds
+    self.path_offset_rate_curvature_adjustment_v = [8.0, 0.0] # this adjustment turns off at higher speeds.  changed first number from 4.0 to 8.0 trying not to cross lines.
     
     # switch from model.position.y-based path offset and path offset rate to laneline-based path offset and path offset rate
     # based on laneline confidence
@@ -309,25 +311,50 @@ class CarController:
         path_offset_rate = 0.0
         lane_change = False
 
-      # trap the previous curvatures for analysis
-      apply_curvature_previous2 = apply_curvature_previous
-      apply_curvature_previous = apply_curvature
-      self.apply_curvature_last = apply_curvature
+      # equate velocity
+      vEgoRaw = CS.out.vEgoRaw
 
-      # Determine if we reached a curve apex (curvature is shrinking 2 scans in a row) and we were in a big curve
-      if (abs(apply_curvature_previous2) > abs(apply_curvature_previous) > abs(apply_curvature)) and abs(apply_curvature_previous2) > 0.012:
-          apex_reached = 1
+      # check for low speed mode
+      if vEgoRaw < 16:
+            low_speed_mode = True
       else:
-          apex_reached = 0
+            low_speed_mode = False
 
-      # If not in testing mode, revert back to a more stock logic
-      # To-do this can be removed
-      # if not self.testing_active:
-        # path_offset = 0
-        # path_offset_rate = 0
-        # desired_curvature_rate = 0
-        # lane_change = False
+      # if low speed mode, control based on wheel angle
+      if low_speed_mode:
+         target_sw_angle = actuators.steeringAngleDeg
+      else:
+         target_sw_angle = CS.out.steeringAngleDeg
 
+     # calculate max steering wheel angle based on speed
+      velocity = np.array([6.7,11.176,15.64,]) # 15,25,35 mph
+      max_angle = np.array([520,380,240])
+      def interpolate_max_angle(vEgoRaw):
+         if vEgoRaw <= velocity[0]:
+            return max_angle[0]
+         elif vEgoRaw >= velocity[-1]:
+            return max_angle[-1]
+         else:
+            #perform interpolation
+           return np.interp(vEgoRaw, velocity, max_angle)
+     
+      # Convert target_sw_angle into a fraction of available steering wheel angle
+      if low_speed_mode:
+         target_output_frac = (target_sw_angle/max_angle)
+      else:
+         target_output_frac = 0
+    
+      #make sure we don't ask for more than max values
+      if target_output_frac > 1.0:
+         target_output_frac = 1.0
+    
+      #multiple all control variable by max their max value from DBC file.  target_output_frac will have a positive or negative sign already
+      if low_speed_mode:
+         path_offset_rate = target_output_frac * (0.5)
+         path_offset = target_output_frac * (5.11)
+         apply_curvature = target_output_frac * (-0.02) #curvature is coming from model and comma curvature is backwards from Ford
+         desired_curvature_rate = target_output_frac * (0.001023)
+    
       # Determine if a human is making a turn
       steeringPressed = CS.out.steeringPressed
       steeringAngleDeg = CS.out.steeringAngleDeg
@@ -338,7 +365,7 @@ class CarController:
           human_turn = 0
 
       #Determin when to reset steering
-      if human_turn or apex_reached:
+      if human_turn: # or apex_reached:
           reset_steering = 1
       else:
           reset_steering = 0
@@ -354,7 +381,19 @@ class CarController:
           # Call the function here to set ramp_type based on lat_accel
           lat_accel = model_data.acceleration.y[3]
           ramp_type = set_ramp_type(lat_accel)
+      
+      # for debugging
+      # time = int(time.time()) #current epoch time
+      cloudlog.info(f"the value of apply_curvature is {apply_curvature}")
+      cloudlog.info(f"the value of apply_curvature_last is {self.apply_curvature_last}")
+      cloudlog.info(f"the value of apply_curvature_last2 is {self.apply_curvature_last2}")
+      cloudlog.info(f"the value of apex_reached is {apex_reached}")
+      cloudlog.info(f"the value of steeringPressed is {steeringPressed}")
+      cloudlog.info(f"the value of steeringAngleDeg is {steeringAngleDeg}")
+      cloudlog.info(f"the value of human_turn is {human_turn}")
+      cloudlog.info(f"the value of reset_steering is {reset_steering}")
 
+      
       if self.CP.carFingerprint in CANFD_CAR:
         # TODO: extended mode
         mode = 1 if CC.latActive else 0
